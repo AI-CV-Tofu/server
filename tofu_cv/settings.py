@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-*mrm@qwgr)b0=4sd$bztvbg1yb=@ku=cxs$!l3#ur7)1n+3@=u
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '44.214.252.225']
 
 
 # Application definition
@@ -48,6 +48,7 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
 
 ROOT_URLCONF = 'tofu_cv.urls'
 
@@ -77,12 +78,16 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'tofu_db',
-        'USER': 'tofu1',
-        'PASSWORD': 'tofu1',
-        'HOST': 'localhost',
+        'USER': 'admin',
+        'PASSWORD': 'smwu-team-tofu',
+        'HOST': 'tofu-db.cj24wem202yj.us-east-1.rds.amazonaws.com',
         'PORT': '3306',
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
     }
 }
+
 
 
 # Password validation
