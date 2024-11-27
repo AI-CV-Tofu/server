@@ -19,9 +19,11 @@ from django.urls import path
 from . import views
 from .views import dashboard_data
 from .views import ProcessImageAPIView
+from .views import DashboardStreamData
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('dashboard/', views.dashboard_data, name='dashboard_data'),
     path('process-image/', ProcessImageAPIView.as_view(), name='process-image'),
+    path('dashboard_stream/', DashboardStreamData.as_view(), name='dashboard_stream')
 ]

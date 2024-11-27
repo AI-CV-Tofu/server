@@ -10,7 +10,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from .db_utils import insert_tofu_production, insert_defect_details, update_tofu_production
 from .db_utils import line_chart, pie_chart, bar_chart
-
+from django.http import StreamingHttpResponse
+import time
 
 
 @api_view(['GET'])
@@ -201,7 +202,7 @@ class ProcessImageAPIView(APIView):
                     # 기존 박스와 비교하여 90% 이상 겹치는 박스 제거
                     keep = True
                     for fbox in filtered_boxes:
-                        if self.is_overlap(box, fbox, threshold=0.9):  # 90% 이상 겹치면 제거
+                        if self.is_overlap(box, fbox, threshold=0.5):  # 90% 이상 겹치면 제거
                             keep = False
                             break
                     if keep:
@@ -246,3 +247,57 @@ class ProcessImageAPIView(APIView):
         # 겹치는 비율 계산
         overlap_ratio = inter_area / min(box1_area, box2_area)
         return overlap_ratio > threshold
+        
+     
+class DashboardStreamData(APIView):
+    def get(self, request):
+        """
+        실시간 대시보드 데이터 스트리밍
+        """
+        def event_stream():
+            while True:
+                try:
+                    # Line chart 데이터
+                    cumulative_OK, cumulative_NG, timestamps = line_chart()
+                    
+                    # Pie chart 데이터
+                    OK_count, NG_count = pie_chart()
+                    
+                    # Bar chart 데이터
+                    defect_types, defect_counts = bar_chart()
+                    
+                    # Response 데이터 정의
+                    response_data = {
+                        'pie_chart': {
+                            'OK': OK_count,
+                            'NG': NG_count
+                        },
+                        'bar_chart': {
+                            'defect_type': defect_types,
+                            'counts': defect_counts
+                        },
+                        'line_chart': {
+                            'timestamp': timestamps,
+                            'OK': cumulative_OK,
+                            'NG': cumulative_NG
+                        }
+                    }
+                    
+                    # SSE 형식으로 데이터 전송
+                    yield f"data: {json.dumps(response_data)}\n\n"
+                    
+                    # 5초마다 데이터 갱신
+                    time.sleep(5)
+                    
+                except Exception as e:
+                    # 에러 발생 시 로깅 또는 에러 이벤트 전송
+                    yield f"event: error\ndata: {str(e)}\n\n"
+                    time.sleep(5)
+
+        response = StreamingHttpResponse(
+            event_stream(), 
+            content_type='text/event-stream'
+        )
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        return response
