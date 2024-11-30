@@ -66,16 +66,16 @@ def bar_chart():
         return None, None  # 연결 실패 시 None 반환
 
     with connection.cursor() as cursor:
-        # 결함 유형별 개수 조회 쿼리
+        # 각 이미지에서 결함 유형별로 1번만 카운트하는 쿼리
         query = """
-        SELECT defect_type, COUNT(*) as defect_count
+        SELECT defect_type, COUNT(DISTINCT tofu_id) as defect_count
         FROM Defect_Details
         GROUP BY defect_type;
         """
         cursor.execute(query)
         rows = cursor.fetchall()
 
-        # 결함 유형과 개수를 저장할 리스트 초기화
+        # 결과를 저장할 리스트 초기화
         defect_types = []
         defect_counts = []
 
@@ -88,9 +88,8 @@ def bar_chart():
     # 연결 종료
     connection.close()
 
-    # 결함 유형과 개수 반환
+    # 결과 반환
     return defect_types, defect_counts
-
 
 
 

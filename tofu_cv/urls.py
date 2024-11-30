@@ -15,7 +15,7 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, re_path
 from . import views
 from .views import dashboard_data
 from .views import ProcessImageAPIView
@@ -23,7 +23,7 @@ from .views import DashboardStreamData
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('dashboard/', views.dashboard_data, name='dashboard_data'),
+    re_path(r'^dashboard/?$', views.dashboard_data, name='dashboard_data'),
     path('process-image/', ProcessImageAPIView.as_view(), name='process-image'),
-    path('dashboard_stream/', DashboardStreamData.as_view(), name='dashboard_stream')
+    path('dashboard-stream/', DashboardStreamData.as_view(), name='dashboard-stream')
 ]

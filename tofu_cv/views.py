@@ -4,6 +4,7 @@ import base64
 import cv2
 import boto3
 import torch
+import time
 from collections import defaultdict
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -11,7 +12,9 @@ from rest_framework.views import APIView
 from .db_utils import insert_tofu_production, insert_defect_details, update_tofu_production
 from .db_utils import line_chart, pie_chart, bar_chart
 from django.http import StreamingHttpResponse
-import time
+from concurrent.futures import ThreadPoolExecutor
+import logging
+logger = logging.getLogger(__name__)
 
 
 @api_view(['GET'])
@@ -29,6 +32,15 @@ def dashboard_data(request):
         # Bar chart 데이터
         defect_types, defect_counts = bar_chart()
         
+        # 모든 defect_type 초기화
+        all_defect_types = ["bubble", "chip", "cut", "debris", "dent", "line", "spot"]
+        defect_data = {defect: 0 for defect in all_defect_types}
+
+        # bar_chart()에서 반환된 데이터로 counts 업데이트
+        for defect, count in zip(defect_types, defect_counts):
+            if defect in defect_data:
+                defect_data[defect] = count
+
         # Response 데이터 정의
         response_data = {
             'pie_chart': {
@@ -36,8 +48,8 @@ def dashboard_data(request):
                 'NG': NG_count
             },
             'bar_chart': {
-                'defect_type': defect_types,
-                'counts': defect_counts
+                'defect_type': list(defect_data.keys()),
+                'counts': list(defect_data.values())
             },
             'line_chart': {
                 'timestamp': timestamps,
@@ -51,6 +63,61 @@ def dashboard_data(request):
         return Response({"status": "error", "message": str(e)}, status=500)
 
 
+
+class DashboardStreamData(APIView):
+    def get(self, request):
+        """
+        실시간 대시보드 데이터 스트리밍
+        """
+        def event_stream():
+            while True:
+                try:
+                    # Line chart 데이터
+                    cumulative_OK, cumulative_NG, timestamps = line_chart()
+        
+                    # Pie chart 데이터
+                    OK_count, NG_count = pie_chart()
+                    
+                    # Bar chart 데이터
+                    defect_types, defect_counts = bar_chart()
+                    
+                    # Response 데이터 정의
+                    response_data = {
+                        'pie_chart': {
+                            'OK': OK_count,
+                            'NG': NG_count
+                        },
+                        'bar_chart': {
+                            'defect_type': defect_types,
+                            'counts': defect_counts
+                        },
+                        'line_chart': {
+                            'timestamp': timestamps,
+                            'OK': cumulative_OK,
+                            'NG': cumulative_NG
+                        }
+                    }
+                    
+                    logger.info(f"전송된 데이터: {response_data}")  # 디버깅 로그
+                    yield f"data: {json.dumps(response_data)}\n\n"
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"SSE 에러: {e}")
+                    yield f"event: error\ndata: {str(e)}\n\n"
+                    time.sleep(1)
+
+        response = StreamingHttpResponse(
+            event_stream(), 
+            content_type='text/event-stream'
+        )
+        response['Access-Control-Allow-Origin'] = '*'
+        response['Access-Control-Allow-Headers'] = '*'
+        response['Access-Control-Allow-Methods'] = 'GET'
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        return response
+    
 
 class ProcessImageAPIView(APIView):
     def post(self, request):
@@ -82,16 +149,18 @@ class ProcessImageAPIView(APIView):
             if tofu_id is None:
                 raise Exception("Failed to insert into Tofu_Production")
 
-            # 4. SageMaker 모델 실행
-            model_result = self.run_model(image_array)
+            # 4. SageMaker 모델 실행 (병렬 처리)
+            model_results = self.run_models(image_array)
 
-            # 5. 모델 결과를 Defect_Details에 저장
-            final_boxes = model_result["boxes"]
-            final_scores = model_result["scores"]
-            final_classes = model_result["classes"]
-            defect_types = model_result["defect_types"]
+            # 5. 결과 결합 및 NMS 적용
+            final_result = self.merge_results(model_results)
 
-            # Defect_Details에 저장 및 defects 리스트 구성
+            # 6. 모델 결과를 Defect_Details에 저장
+            final_boxes = final_result["boxes"]
+            final_scores = final_result["scores"]
+            final_classes = final_result["classes"]
+            defect_types = final_result["defect_types"]
+
             defects = []
             all_classes_are_cut = True  # 모든 클래스가 2인지 확인
             if final_boxes and len(final_boxes) > 0:
@@ -139,92 +208,85 @@ class ProcessImageAPIView(APIView):
         except Exception as e:
             return Response({"status": "error", "message": str(e)}, status=500)
 
-    def run_model(self, image_array):
+    def run_models(self, image_array):
         """
-        SageMaker 모델 실행 및 결과 반환
+        두 SageMaker 모델을 병렬로 호출하여 결과 반환
         """
-        print("Running model with image_array shape:", image_array.shape)
-        
-        # SageMaker에 보낼 이미지를 준비
         resized_image = cv2.resize(image_array, (640, 640))  # 크기 조정
         resized_jpeg = cv2.imencode('.jpg', resized_image)[1]
         payload = base64.b64encode(resized_jpeg).decode('utf-8')
 
-        # SageMaker 호출
+        endpoints = ["square-tofu-v5", "square-tofu-v4"]
         runtime = boto3.client('runtime.sagemaker')
-        response = runtime.invoke_endpoint(
-            EndpointName="square-tofu-v5",
-            ContentType='text/csv',
-            Body=payload
-        )
-        response_body = response['Body'].read()
-        result = json.loads(response_body.decode('ascii'))
 
-        # 라벨 변환
+        def invoke_endpoint(endpoint):
+            response = runtime.invoke_endpoint(
+                EndpointName=endpoint,
+                ContentType='text/csv',
+                Body=payload
+            )
+            response_body = response['Body'].read()
+            return json.loads(response_body.decode('ascii'))
+
+        # 병렬로 모델 호출
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(invoke_endpoint, endpoints))
+
+        return results
+
+    def merge_results(self, model_results):
+        """
+        두 모델의 결과를 결합하고 NMS 적용
+        """
         custom_labels = ["bubble", "chip", "cut", "debris", "dent", "line", "spot"]
-        final_boxes = []
-        final_scores = []
-        final_classes = []
-        defect_types = []
+        combined_boxes = []
+        combined_scores = []
+        combined_classes = []
+        combined_defect_types = []
 
-        if 'boxes' in result:
-            class_boxes = defaultdict(list)
-            class_scores = defaultdict(list)
-            class_classes = defaultdict(list)
+        # 결과 결합
+        for result in model_results:
+            if 'boxes' in result:
+                for box in result['boxes']:
+                    combined_boxes.append(box[:4])
+                    combined_scores.append(box[4])
+                    combined_classes.append(int(box[-1]))
+                    combined_defect_types.append(custom_labels[int(box[-1])])
 
-            # 클래스별로 박스, 스코어, 클래스 분류
-            for box in result['boxes']:
-                bounding_box = box[:4]
-                score = box[4]
-                cls = int(box[-1])  # 클래스 번호
-                class_boxes[cls].append(bounding_box)
-                class_scores[cls].append(score)
-                class_classes[cls].append(cls)
+        # NMS 적용 (Non-Maximum Suppression)
+        final_boxes, final_scores, final_classes = self.apply_nms(combined_boxes, combined_scores, combined_classes)
+        final_defect_types = [custom_labels[cls] for cls in final_classes]
 
-            # NMS를 적용하여 최종 결과 생성
-            for cls in class_boxes:
-                boxes_tensor = torch.tensor(class_boxes[cls])
-                scores_tensor = torch.tensor(class_scores[cls])
-
-                # 점수 순으로 정렬
-                indices = torch.argsort(scores_tensor, descending=True)
-
-                # 90% 이상 겹치는 박스 제거
-                filtered_boxes = []
-                filtered_scores = []
-                filtered_classes = []
-
-                for idx in indices:
-                    box = class_boxes[cls][idx]
-                    score = class_scores[cls][idx]
-                    label = class_classes[cls][idx]
-
-                    # 기존 박스와 비교하여 90% 이상 겹치는 박스 제거
-                    keep = True
-                    for fbox in filtered_boxes:
-                        if self.is_overlap(box, fbox, threshold=0.5):  # 90% 이상 겹치면 제거
-                            keep = False
-                            break
-                    if keep:
-                        filtered_boxes.append(box)
-                        filtered_scores.append(score)
-                        filtered_classes.append(label)
-
-                # 최종 결과에 추가
-                final_boxes.extend(filtered_boxes)
-                final_scores.extend(filtered_scores)
-                final_classes.extend(filtered_classes)
-                defect_types.extend([custom_labels[cls]] * len(filtered_boxes))
-
-        print("Final Scores:", final_scores)
         return {
             "boxes": final_boxes,
             "scores": final_scores,
             "classes": final_classes,
-            "defect_types": defect_types
+            "defect_types": final_defect_types
         }
 
-    def is_overlap(self, box1, box2, threshold=0.9):
+    def apply_nms(self, boxes, scores, classes, threshold=0.5):
+        """
+        Non-Maximum Suppression(NMS)을 적용하여 중복 박스를 제거
+        """
+        indices = torch.argsort(torch.tensor(scores), descending=True)
+        selected_indices = []
+
+        for i in indices:
+            keep = True
+            for j in selected_indices:
+                if self.is_overlap(boxes[i], boxes[j], threshold):
+                    keep = False
+                    break
+            if keep:
+                selected_indices.append(i)
+
+        final_boxes = [boxes[i] for i in selected_indices]
+        final_scores = [scores[i] for i in selected_indices]
+        final_classes = [classes[i] for i in selected_indices]
+
+        return final_boxes, final_scores, final_classes
+
+    def is_overlap(self, box1, box2, threshold=0.5):
         """
         두 박스가 주어진 threshold 이상 겹치는지 확인
         """
@@ -247,57 +309,3 @@ class ProcessImageAPIView(APIView):
         # 겹치는 비율 계산
         overlap_ratio = inter_area / min(box1_area, box2_area)
         return overlap_ratio > threshold
-        
-     
-class DashboardStreamData(APIView):
-    def get(self, request):
-        """
-        실시간 대시보드 데이터 스트리밍
-        """
-        def event_stream():
-            while True:
-                try:
-                    # Line chart 데이터
-                    cumulative_OK, cumulative_NG, timestamps = line_chart()
-                    
-                    # Pie chart 데이터
-                    OK_count, NG_count = pie_chart()
-                    
-                    # Bar chart 데이터
-                    defect_types, defect_counts = bar_chart()
-                    
-                    # Response 데이터 정의
-                    response_data = {
-                        'pie_chart': {
-                            'OK': OK_count,
-                            'NG': NG_count
-                        },
-                        'bar_chart': {
-                            'defect_type': defect_types,
-                            'counts': defect_counts
-                        },
-                        'line_chart': {
-                            'timestamp': timestamps,
-                            'OK': cumulative_OK,
-                            'NG': cumulative_NG
-                        }
-                    }
-                    
-                    # SSE 형식으로 데이터 전송
-                    yield f"data: {json.dumps(response_data)}\n\n"
-                    
-                    # 5초마다 데이터 갱신
-                    time.sleep(5)
-                    
-                except Exception as e:
-                    # 에러 발생 시 로깅 또는 에러 이벤트 전송
-                    yield f"event: error\ndata: {str(e)}\n\n"
-                    time.sleep(5)
-
-        response = StreamingHttpResponse(
-            event_stream(), 
-            content_type='text/event-stream'
-        )
-        response['Cache-Control'] = 'no-cache'
-        response['X-Accel-Buffering'] = 'no'
-        return response
